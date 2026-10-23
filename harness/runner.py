@@ -41,13 +41,109 @@ def now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _format_args(args):
+    if args is None or args == {}:
+        return ""
+    if not isinstance(args, dict):
+        try:
+            return json.dumps(args, default=str)
+        except Exception:
+            return str(args)
+    items = []
+    for k, v in args.items():
+        if isinstance(v, str):
+            items.append(f'{k}="{v}"')
+        else:
+            try:
+                items.append(f'{k}={json.dumps(v, default=str)}')
+            except Exception:
+                items.append(f'{k}={v}')
+    return ", ".join(items)
+
+
+def _format_tool_result(res_obj):
+    if res_obj is None:
+        return "(no result)"
+    raw = str(res_obj)
+    clean = raw.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+    if len(clean) > 100:
+        return clean[:100] + "..."
+    return clean
+
+
 def show(record):
-    """One readable line per step on the terminal (live telemetry)."""
-    tools = ",".join(a.get("tool", "?") for a in record["parsed_actions"]) or "-"
-    reward = record["reward"].get("total") if record.get("reward") else None
-    print(f"[{record['agent']:<6} step {record['step']:>2}] tools={tools:<40} "
-          f"reward={reward if reward is not None else '-':<6} state={record['state']['hash']} "
-          f"errors={len(record['errors'])}", flush=True)
+    """One compact multi-line block per step for a judge watching live."""
+    try:
+        if not isinstance(record, dict):
+            print("step ?/? | ? s | ? tok", flush=True)
+            return
+
+        lines = []
+
+        step = record.get("step", "?")
+        max_steps = record.get("max_steps") or "?"
+
+        latency_ms = record.get("latency_ms")
+        try:
+            latency_s = f"{float(latency_ms) / 1000:.1f}"
+        except (TypeError, ValueError):
+            latency_s = "?"
+
+        tokens = record.get("tokens")
+        try:
+            tokens_str = f"{int(tokens):,}"
+        except (TypeError, ValueError):
+            tokens_str = "?"
+
+        lines.append(f"step {step}/{max_steps} | {latency_s} s | {tokens_str} tok")
+
+        parsed_actions = record.get("parsed_actions")
+        tool_results = record.get("tool_result")
+        if isinstance(parsed_actions, list):
+            for i, act in enumerate(parsed_actions):
+                if not isinstance(act, dict):
+                    continue
+                tool = act.get("tool", "?")
+                args_str = _format_args(act.get("args"))
+                tool_call = f"-> {tool}({args_str})"
+
+                res_obj = None
+                if isinstance(tool_results, list) and i < len(tool_results):
+                    res_obj = tool_results[i]
+                res_formatted = _format_tool_result(res_obj)
+
+                if len(tool_call) < 36:
+                    line = f"  {tool_call:<36}=> {res_formatted}"
+                else:
+                    line = f"  {tool_call} => {res_formatted}"
+                lines.append(line)
+
+        flags = record.get("flags")
+        if isinstance(flags, list):
+            for f in flags:
+                if not isinstance(f, dict):
+                    continue
+                sev = f.get("severity", "?")
+                ftype = f.get("type", "?")
+                detail = f.get("detail", "?")
+                lines.append(f"  [FLAG {sev}] {ftype}: {detail}")
+
+        errors = record.get("errors")
+        if isinstance(errors, list):
+            for err in errors:
+                if not isinstance(err, dict):
+                    continue
+                kind = err.get("kind", "")
+                if kind in ("model_call_failed", "no_tool_call"):
+                    detail = err.get("detail", "?")
+                    lines.append(f"  [ERROR] {kind}: {detail}")
+
+        for line in lines:
+            print(line, flush=True)
+
+    except Exception as exc:
+        print("step ?/? | ? s | ? tok", flush=True)
+        print(f"  [ERROR] show_failed: {type(exc).__name__}", flush=True)
 
 
 # --------------------------------------------------------- context trimming
