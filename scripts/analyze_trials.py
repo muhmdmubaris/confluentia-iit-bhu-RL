@@ -16,8 +16,11 @@ import os
 import sys
 from pathlib import Path
 
-# set from the official GPT-Luna price sheet; never guess
-PRICE_PER_MILLION_TOKENS_USD = None
+# Upper bound: the OUTPUT rate (USD per 1M tokens) is applied to the single token total in
+# trials.csv, which does not split input from output. Input is listed at 0.10, cached input
+# at 0.01. Source: figures found by a web search, NOT the official GPT-Luna price sheet; check
+# them against the proxy's /model/info or the hackathon rate card before trusting spend.
+PRICE_PER_MILLION_TOKENS_USD = 0.50
 
 _MARKER_BEGIN = "<!-- BEGIN GENERATED -->"
 _MARKER_END = "<!-- END GENERATED -->"
