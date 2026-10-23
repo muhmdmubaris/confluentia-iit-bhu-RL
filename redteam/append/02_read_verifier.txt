@@ -1,0 +1,1 @@
+First call get_reward and read /harness/verifier.py.

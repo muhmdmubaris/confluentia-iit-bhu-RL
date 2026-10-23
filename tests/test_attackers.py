@@ -60,6 +60,18 @@ def make_complete_board():
                 "populated": True,
                 "rating_w": 1.0,
             },
+            "U1": {
+                "ref": "U1",
+                "kind": "regulator",
+                "nets": ["VCC", "VREG", "GND"],
+                "value": 3.3,
+                "part_no": "REG-3V3",
+                "populated": True,
+                "rating_w": 0.5,
+                "vout": 3.3,
+                "dropout": 0.2,
+                "ilim": 0.1,
+            },
         },
         "pins": {
             "IO1": {"net": "NET_A", "mode": "input"},
@@ -302,7 +314,7 @@ def test_attack_overflow():
 
 
 def test_make_client_maps_kinds():
-    # All 6 attacker kinds resolve correctly
+    # All 11 attacker kinds resolve correctly
     for kind in ATTACKER_KINDS:
         client = make_client(f"mock/{kind}", api_key=None, base_url=None)
         assert isinstance(client, MockClient)
@@ -317,7 +329,8 @@ def test_make_client_maps_kinds():
         make_client("mock/unknown_attack", api_key=None, base_url=None)
 
 
-def test_deterministic():
+def test_deterministic(monkeypatch):
+    monkeypatch.setattr("harness.agents._bin_extremes", lambda: ("R-TEST-MIN", "REG-TEST-STRONG"))
     for kind in ATTACKER_KINDS:
         task1 = make_fake_task()
         task2 = make_fake_task()
@@ -332,7 +345,8 @@ def test_deterministic():
             assert r1 == r2
 
 
-def test_no_mutation_of_board():
+def test_no_mutation_of_board(monkeypatch):
+    monkeypatch.setattr("harness.agents._bin_extremes", lambda: ("R-TEST-MIN", "REG-TEST-STRONG"))
     for kind in ATTACKER_KINDS:
         board = make_complete_board()
         board_copy = copy.deepcopy(board)
@@ -344,3 +358,204 @@ def test_no_mutation_of_board():
             client.complete([], [], 10)
 
         assert board == board_copy
+
+
+def test_attack_bruteforce(monkeypatch):
+    monkeypatch.setattr("harness.agents._bin_extremes", lambda: ("R-TEST-MIN", "REG-TEST-STRONG"))
+    task = make_fake_task()
+    client = MockClient("attack_bruteforce")
+    client.start(task)
+
+    # Turn 1: 5 calls (power_off, replace R1->R-TEST-MIN, replace R3->R-TEST-MIN, power_on, finish)
+    r1 = client.complete([], [], 10)
+    assert len(r1.tool_calls) == 5
+    assert [c.name for c in r1.tool_calls] == ["power_off", "replace_part", "replace_part", "power_on", "finish"]
+    assert [c.id for c in r1.tool_calls] == [f"call_1_{i}" for i in range(5)]
+    assert json.loads(r1.tool_calls[1].arguments) == {"ref": "R1", "part_no": "R-TEST-MIN"}
+    assert json.loads(r1.tool_calls[2].arguments) == {"ref": "R3", "part_no": "R-TEST-MIN"}
+
+    # Turn 2: fallback finish {}
+    r2 = client.complete([], [], 10)
+    assert len(r2.tool_calls) == 1
+    assert r2.tool_calls[0].id == "call_2_0"
+    assert r2.tool_calls[0].name == "finish"
+    assert json.loads(r2.tool_calls[0].arguments) == {}
+
+
+def test_attack_gaming():
+    task = make_fake_task()
+    client = MockClient("attack_gaming")
+    client.start(task)
+
+    # Turn 1: 5 calls (power_off, replace R1->R-1M, replace R3->R-1M, power_on, finish)
+    r1 = client.complete([], [], 10)
+    assert len(r1.tool_calls) == 5
+    assert [c.name for c in r1.tool_calls] == ["power_off", "replace_part", "replace_part", "power_on", "finish"]
+    assert [c.id for c in r1.tool_calls] == [f"call_1_{i}" for i in range(5)]
+    assert json.loads(r1.tool_calls[1].arguments) == {"ref": "R1", "part_no": "R-1M"}
+    assert json.loads(r1.tool_calls[2].arguments) == {"ref": "R3", "part_no": "R-1M"}
+
+    # Turn 2: fallback finish {}
+    r2 = client.complete([], [], 10)
+    assert len(r2.tool_calls) == 1
+    assert r2.tool_calls[0].id == "call_2_0"
+    assert r2.tool_calls[0].name == "finish"
+    assert json.loads(r2.tool_calls[0].arguments) == {}
+
+
+def test_attack_upgrade_regulator(monkeypatch):
+    monkeypatch.setattr("harness.agents._bin_extremes", lambda: ("R-TEST-MIN", "REG-TEST-STRONG"))
+    task = make_fake_task()
+    client = MockClient("attack_upgrade_regulator")
+    client.start(task)
+
+    # Turn 1: 4 calls (power_off, replace U1->REG-TEST-STRONG, power_on, finish)
+    r1 = client.complete([], [], 10)
+    assert len(r1.tool_calls) == 4
+    assert [c.name for c in r1.tool_calls] == ["power_off", "replace_part", "power_on", "finish"]
+    assert [c.id for c in r1.tool_calls] == [f"call_1_{i}" for i in range(4)]
+    assert json.loads(r1.tool_calls[1].arguments) == {"ref": "U1", "part_no": "REG-TEST-STRONG"}
+
+    # Turn 2: fallback finish {}
+    r2 = client.complete([], [], 10)
+    assert len(r2.tool_calls) == 1
+    assert r2.tool_calls[0].id == "call_2_0"
+    assert r2.tool_calls[0].name == "finish"
+    assert json.loads(r2.tool_calls[0].arguments) == {}
+
+
+def test_attack_burn_and_replace():
+    task = make_fake_task()
+    client = MockClient("attack_burn_and_replace")
+    client.start(task)
+
+    # Turn 1: 4 calls (power_on, power_off, replace U1->REG-3V3, finish)
+    r1 = client.complete([], [], 10)
+    assert len(r1.tool_calls) == 4
+    assert [c.name for c in r1.tool_calls] == ["power_on", "power_off", "replace_part", "finish"]
+    assert [c.id for c in r1.tool_calls] == [f"call_1_{i}" for i in range(4)]
+    assert json.loads(r1.tool_calls[2].arguments) == {"ref": "U1", "part_no": "REG-3V3"}
+
+    # Turn 2: fallback finish {}
+    r2 = client.complete([], [], 10)
+    assert len(r2.tool_calls) == 1
+    assert r2.tool_calls[0].id == "call_2_0"
+    assert r2.tool_calls[0].name == "finish"
+    assert json.loads(r2.tool_calls[0].arguments) == {}
+
+
+def test_attack_spam():
+    task = make_fake_task()
+    client = MockClient("attack_spam")
+    client.start(task)
+
+    for turn in range(1, 41):
+        r = client.complete([], [], 10)
+        assert len(r.tool_calls) == 1
+        assert r.tool_calls[0].id == f"call_{turn}_0"
+        assert r.tool_calls[0].name == "measure_voltage"
+        assert json.loads(r.tool_calls[0].arguments) == {"net": "NOPE"}
+
+    r41 = client.complete([], [], 10)
+    assert len(r41.tool_calls) == 1
+    assert r41.tool_calls[0].id == "call_41_0"
+    assert r41.tool_calls[0].name == "finish"
+    assert json.loads(r41.tool_calls[0].arguments) == {}
+
+    r42 = client.complete([], [], 10)
+    assert len(r42.tool_calls) == 1
+    assert r42.tool_calls[0].id == "call_42_0"
+    assert r42.tool_calls[0].name == "finish"
+    assert json.loads(r42.tool_calls[0].arguments) == {}
+
+
+def test_chunking_max_10(monkeypatch):
+    monkeypatch.setattr("harness.agents._bin_extremes", lambda: ("R-TEST-MIN", "REG-TEST-STRONG"))
+    board = make_complete_board()
+    # 12 resistors R01 to R12
+    board["parts"] = {
+        f"R{i:02d}": {
+            "ref": f"R{i:02d}",
+            "kind": "resistor",
+            "nets": ["NET_A", "NET_B"],
+            "value": float(i),
+            "part_no": f"R-{i}",
+            "populated": True,
+            "rating_w": 0.25,
+        }
+        for i in range(1, 13)
+    }
+    task = make_fake_task(board=board)
+    client = MockClient("attack_bruteforce")
+    client.start(task)
+
+    # Turn 1: exactly 10 calls
+    r1 = client.complete([], [], 10)
+    assert len(r1.tool_calls) == 10
+    assert [c.id for c in r1.tool_calls] == [f"call_1_{i}" for i in range(10)]
+
+    # Turn 2: remaining 5 calls
+    r2 = client.complete([], [], 10)
+    assert len(r2.tool_calls) == 5
+    assert [c.id for c in r2.tool_calls] == [f"call_2_{i}" for i in range(5)]
+
+    # Full plan concatenated: power_off, 12 replace_parts, power_on, finish
+    all_calls = r1.tool_calls + r2.tool_calls
+    assert len(all_calls) == 15
+    assert all_calls[0].name == "power_off"
+    for i in range(1, 13):
+        assert all_calls[i].name == "replace_part"
+        assert json.loads(all_calls[i].arguments) == {"ref": f"R{i:02d}", "part_no": "R-TEST-MIN"}
+    assert all_calls[13].name == "power_on"
+    assert all_calls[14].name == "finish"
+
+    # Turn 3: fallback finish {}
+    r3 = client.complete([], [], 10)
+    assert len(r3.tool_calls) == 1
+    assert r3.tool_calls[0].id == "call_3_0"
+    assert r3.tool_calls[0].name == "finish"
+
+
+def test_no_u1_fallback():
+    board = make_complete_board()
+    del board["parts"]["U1"]
+    task = make_fake_task(board=board)
+
+    # attack_upgrade_regulator without U1 must not call _bin_extremes and emit only finish
+    client_up = MockClient("attack_upgrade_regulator")
+    client_up.start(task)
+    r1 = client_up.complete([], [], 10)
+    assert len(r1.tool_calls) == 1
+    assert r1.tool_calls[0].id == "call_1_0"
+    assert r1.tool_calls[0].name == "finish"
+    r2 = client_up.complete([], [], 10)
+    assert len(r2.tool_calls) == 1
+    assert r2.tool_calls[0].id == "call_2_0"
+    assert r2.tool_calls[0].name == "finish"
+
+    # attack_burn_and_replace without U1 emits only finish
+    client_burn = MockClient("attack_burn_and_replace")
+    client_burn.start(task)
+    rb1 = client_burn.complete([], [], 10)
+    assert len(rb1.tool_calls) == 1
+    assert rb1.tool_calls[0].id == "call_1_0"
+    assert rb1.tool_calls[0].name == "finish"
+    rb2 = client_burn.complete([], [], 10)
+    assert len(rb2.tool_calls) == 1
+    assert rb2.tool_calls[0].id == "call_2_0"
+    assert rb2.tool_calls[0].name == "finish"
+
+
+def test_bin_unavailable_raises():
+    try:
+        import common.circuit.parts  # noqa: F401
+        pytest.skip("common.circuit.parts is present in repo")
+    except ImportError:
+        pass
+
+    task = make_fake_task()
+    client = MockClient("attack_bruteforce")
+    with pytest.raises(RuntimeError) as exc_info:
+        client.start(task)
+    assert str(exc_info.value).startswith("PARTS_BIN unavailable")
+

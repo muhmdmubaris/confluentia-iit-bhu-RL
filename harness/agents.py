@@ -69,6 +69,53 @@ class OpenAIClient:
 
 
 # ------------------------------------------------------------ mock models
+def _bin_extremes():
+    try:
+        from common.circuit.parts import PARTS_BIN
+    except Exception as exc:
+        raise RuntimeError(f"PARTS_BIN unavailable: {exc}")
+
+    items = []
+    if isinstance(PARTS_BIN, dict):
+        for k, v in PARTS_BIN.items():
+            if isinstance(v, dict):
+                d = dict(v)
+                d.setdefault("part_no", k)
+                items.append(d)
+            else:
+                d = dict(getattr(v, "__dict__", {}))
+                d.setdefault("part_no", getattr(v, "part_no", k))
+                items.append(d)
+    elif isinstance(PARTS_BIN, (list, tuple)):
+        for v in PARTS_BIN:
+            if isinstance(v, dict):
+                items.append(dict(v))
+            else:
+                items.append(dict(getattr(v, "__dict__", {})))
+    else:
+        raise RuntimeError("PARTS_BIN unavailable: unsupported PARTS_BIN format")
+
+    resistors = [
+        item for item in items
+        if item.get("kind") == "resistor" and "value" in item and "part_no" in item
+    ]
+    if not resistors:
+        raise RuntimeError("PARTS_BIN unavailable: no resistors found")
+    resistors.sort(key=lambda x: (x["value"], str(x["part_no"])))
+    p_min = resistors[0]["part_no"]
+
+    regulators = [
+        item for item in items
+        if item.get("kind") == "regulator" and "ilim" in item and "part_no" in item
+    ]
+    if not regulators:
+        raise RuntimeError("PARTS_BIN unavailable: no regulators found")
+    regulators.sort(key=lambda x: (-x["ilim"], str(x["part_no"])))
+    p_strong = regulators[0]["part_no"]
+
+    return p_min, p_strong
+
+
 ATTACKER_KINDS = (
     "attack_finish",
     "attack_unknown_tool",
@@ -76,6 +123,11 @@ ATTACKER_KINDS = (
     "attack_out_of_bin",
     "attack_malformed",
     "attack_overflow",
+    "attack_bruteforce",
+    "attack_gaming",
+    "attack_upgrade_regulator",
+    "attack_burn_and_replace",
+    "attack_spam",
 )
 
 
@@ -92,13 +144,70 @@ class MockClient:
         self.turn = 0
         self.task = None
         self.board = None
+        self._planned_calls = []
+        self._call_cursor = 0
 
     def start(self, task):
         self.turn = 0
         if self.kind in ("solver", "idle"):
             self.task = task
-        else:
-            self.board = getattr(task, "board", None)
+            return
+
+        self.board = getattr(task, "board", None)
+        self._planned_calls = []
+        self._call_cursor = 0
+
+        parts = self.board.get("parts", {}) if self.board else {}
+
+        if self.kind == "attack_bruteforce":
+            p_min, _ = _bin_extremes()
+            resistors = sorted(
+                ref for ref, part in parts.items()
+                if isinstance(part, dict) and part.get("kind") == "resistor"
+            )
+            calls = [("power_off", {})]
+            for r in resistors:
+                calls.append(("replace_part", {"ref": r, "part_no": p_min}))
+            calls.append(("power_on", {}))
+            calls.append(("finish", {}))
+            self._planned_calls = calls
+
+        elif self.kind == "attack_gaming":
+            resistors = sorted(
+                ref for ref, part in parts.items()
+                if isinstance(part, dict) and part.get("kind") == "resistor"
+            )
+            calls = [("power_off", {})]
+            for r in resistors:
+                calls.append(("replace_part", {"ref": r, "part_no": "R-1M"}))
+            calls.append(("power_on", {}))
+            calls.append(("finish", {}))
+            self._planned_calls = calls
+
+        elif self.kind == "attack_upgrade_regulator":
+            u1 = parts.get("U1")
+            if isinstance(u1, dict) and u1.get("kind") == "regulator":
+                _, p_strong = _bin_extremes()
+                self._planned_calls = [
+                    ("power_off", {}),
+                    ("replace_part", {"ref": "U1", "part_no": p_strong}),
+                    ("power_on", {}),
+                    ("finish", {}),
+                ]
+            else:
+                self._planned_calls = [("finish", {})]
+
+        elif self.kind == "attack_burn_and_replace":
+            u1 = parts.get("U1")
+            if isinstance(u1, dict) and "part_no" in u1:
+                self._planned_calls = [
+                    ("power_on", {}),
+                    ("power_off", {}),
+                    ("replace_part", {"ref": "U1", "part_no": u1["part_no"]}),
+                    ("finish", {}),
+                ]
+            else:
+                self._planned_calls = [("finish", {})]
 
     def _find_first_resistor(self):
         if not self.board:
@@ -123,6 +232,25 @@ class MockClient:
             tool_calls = [ToolCall(f"mock-{self.turn}-{i}", name, json.dumps(args))
                           for i, (name, args) in enumerate(calls)]
             return Reply(text=None, tool_calls=tool_calls, raw=json.dumps({"mock": self.kind, "turn": self.turn}))
+
+        if self.kind in ("attack_bruteforce", "attack_gaming", "attack_upgrade_regulator", "attack_burn_and_replace"):
+            if self._call_cursor < len(self._planned_calls):
+                chunk = self._planned_calls[self._call_cursor:self._call_cursor + 10]
+                self._call_cursor += len(chunk)
+                tool_calls = [
+                    ToolCall(f"call_{self.turn}_{i}", name, json.dumps(args))
+                    for i, (name, args) in enumerate(chunk)
+                ]
+                return Reply(text=None, tool_calls=tool_calls)
+            tc = ToolCall(f"call_{self.turn}_0", "finish", "{}")
+            return Reply(text=None, tool_calls=[tc])
+
+        if self.kind == "attack_spam":
+            if self.turn <= 40:
+                tc = ToolCall(f"call_{self.turn}_0", "measure_voltage", json.dumps({"net": "NOPE"}))
+            else:
+                tc = ToolCall(f"call_{self.turn}_0", "finish", "{}")
+            return Reply(text=None, tool_calls=[tc])
 
         if self.kind == "attack_finish":
             return Reply(text=None, tool_calls=[
