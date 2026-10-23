@@ -6,6 +6,7 @@ import pytest
 from common.circuit.actions import (
     ARG_SCHEMA,
     HANDLERS,
+    IMPLEMENTED_TOOLS,
     TOOL_NAMES,
     apply_tool,
     clip,
@@ -141,7 +142,7 @@ VALID_ARGS = {
 
 @pytest.mark.parametrize("tool_name", TOOL_NAMES)
 def test_purity(tool_name):
-    """Input board is never mutated; new board equals deepcopy before call."""
+    """Input board is never mutated; unchanged tools and error calls preserve new_board."""
     board = small_board()
     board_before = copy.deepcopy(board)
     args = VALID_ARGS[tool_name]
@@ -149,9 +150,20 @@ def test_purity(tool_name):
     new_board, output, is_error = apply_tool(board, tool_name, args)
 
     assert board == board_before
-    assert new_board == board_before
+    assert new_board is not board
     assert isinstance(output, str)
     assert isinstance(is_error, bool)
+
+    read_only_tools = {
+        "read_spec",
+        "list_parts",
+        "inspect",
+        "read_schematic",
+        "list_bin",
+        "finish",
+    }
+    if is_error or tool_name in read_only_tools:
+        assert new_board == board_before
 
 
 def test_never_raises_on_garbage_args():
@@ -178,11 +190,8 @@ def test_unknown_tool():
     assert out == "error: unknown tool 'foobar'"
 
 
-def test_unimplemented_tool():
-    board = small_board()
-    new_board, out, is_err = apply_tool(board, "power_on", {})
-    assert is_err is True
-    assert out == "error: tool 'power_on' is not implemented yet"
+def test_all_tools_implemented():
+    assert IMPLEMENTED_TOOLS == set(TOOL_NAMES)
 
 
 def test_missing_unknown_wrong_type_args():

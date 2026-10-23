@@ -117,6 +117,59 @@ def clip(text: str) -> str:
     return text
 
 
+# ---------------------------------------------------------------------------
+# Private bin adapters: the ONLY places that touch PARTS_BIN / lookup
+# ---------------------------------------------------------------------------
+def _bin_get(part_no: str) -> dict | None:
+    """Look up a single part from the bin. Handles dict-of-parts and list-of-parts."""
+    from common.circuit.parts import PARTS_BIN, lookup
+
+    try:
+        item = lookup(part_no)
+        if item is not None:
+            d = dict(item) if isinstance(item, dict) else dict(getattr(item, "__dict__", {}))
+            d.setdefault("part_no", part_no)
+            return d
+    except (KeyError, LookupError):
+        pass
+
+    if isinstance(PARTS_BIN, dict):
+        if part_no in PARTS_BIN:
+            item = PARTS_BIN[part_no]
+            d = dict(item) if isinstance(item, dict) else dict(getattr(item, "__dict__", {}))
+            d.setdefault("part_no", part_no)
+            return d
+    elif isinstance(PARTS_BIN, (list, tuple)):
+        for item in PARTS_BIN:
+            pno = item.get("part_no") if isinstance(item, dict) else getattr(item, "part_no", None)
+            if pno == part_no:
+                d = dict(item) if isinstance(item, dict) else dict(getattr(item, "__dict__", {}))
+                return d
+
+    return None
+
+
+def _bin_all(kind: str) -> list[dict]:
+    """Retrieve all parts of the specified kind from PARTS_BIN."""
+    from common.circuit.parts import PARTS_BIN
+
+    items: list[dict] = []
+    if isinstance(PARTS_BIN, dict):
+        for k, v in PARTS_BIN.items():
+            d = dict(v) if isinstance(v, dict) else dict(getattr(v, "__dict__", {}))
+            d.setdefault("part_no", k)
+            items.append(d)
+    elif isinstance(PARTS_BIN, (list, tuple)):
+        for v in PARTS_BIN:
+            d = dict(v) if isinstance(v, dict) else dict(getattr(v, "__dict__", {}))
+            items.append(d)
+
+    return [d for d in items if d.get("kind") == kind]
+
+
+# ---------------------------------------------------------------------------
+# Read-only tools (B1.1)
+# ---------------------------------------------------------------------------
 def _tool_read_spec(board: dict, args: dict) -> tuple[str, bool]:
     spec = board.get("spec")
     if not spec:
@@ -314,11 +367,273 @@ def _tool_read_schematic(board: dict, args: dict) -> tuple[str, bool]:
     return (footer, False)
 
 
+# ---------------------------------------------------------------------------
+# Mutating, power, measurement and catalog tools (B1.2)
+# ---------------------------------------------------------------------------
+def _tool_finish(board: dict, args: dict) -> tuple[str, bool]:
+    return ("finish received", False)
+
+
+def _tool_power_off(board: dict, args: dict) -> tuple[str, bool]:
+    board["powered"] = False
+    board.setdefault("history", []).append({"tool": "power_off", "args": dict(args)})
+    return ("board powered off", False)
+
+
+def _tool_power_on(board: dict, args: dict) -> tuple[str, bool]:
+    if board.get("powered", False):
+        board.setdefault("history", []).append({"tool": "power_on", "args": dict(args)})
+        return ("board already powered", False)
+
+    from common.circuit.solver import solve
+
+    sol = solve(board)
+    sol_p = sol.get("p", {})
+    sol_i = sol.get("i", {})
+
+    parts_dict = board.get("parts") or {}
+    damaged_set = set(board.get("damaged") or [])
+    newly_damaged: list[str] = []
+
+    for ref, part in parts_dict.items():
+        if not part.get("populated", True):
+            continue
+        if ref in damaged_set:
+            continue
+
+        rating_w = part.get("rating_w", float("inf"))
+        p = sol_p.get(ref, 0.0)
+        is_damaged = False
+
+        if p > 1.5 * rating_w:
+            is_damaged = True
+        elif part.get("kind") == "led":
+            imax = part.get("imax", float("inf"))
+            i = sol_i.get(ref, 0.0)
+            if abs(i) > 1.5 * imax:
+                is_damaged = True
+
+        if is_damaged:
+            newly_damaged.append(ref)
+
+    newly_damaged.sort(key=natural_sort_key)
+
+    current_damaged = list(board.get("damaged") or [])
+    board["damaged"] = sorted(list(set(current_damaged + newly_damaged)), key=natural_sort_key)
+    board["powered"] = True
+    board.setdefault("history", []).append({"tool": "power_on", "args": dict(args)})
+
+    lines = ["board powered"]
+    for ref in newly_damaged:
+        lines.append(f"smoke from {ref}")
+    return ("\n".join(lines), False)
+
+
+def _tool_measure_voltage(board: dict, args: dict) -> tuple[str, bool]:
+    if not board.get("powered", False):
+        return ("error: board is not powered; call power_on", True)
+
+    net = args["net"]
+    all_nets = set()
+    for part in (board.get("parts") or {}).values():
+        all_nets.update(part.get("nets", []))
+    for pin_info in (board.get("pins") or {}).values():
+        if pin_info.get("net"):
+            all_nets.add(pin_info["net"])
+
+    if net not in all_nets:
+        return (f"error: no net '{net}'. Use read_schematic to see nets.", True)
+
+    budget = board.get("probe_budget")
+    used = board.get("probes_used", 0)
+    if budget is not None and used >= budget:
+        return (f"error: probe budget used up ({used}/{budget})", True)
+
+    # Call solve() FIRST before mutating probes_used (failure atomicity)
+    from common.circuit.solver import solve
+
+    sol = solve(board)
+
+    board["probes_used"] = used + 1
+    v = sol.get("v", {}).get(net, 0.0)
+    return (f"V({net}) = {fmt_volts(v)}", False)
+
+
+def _tool_measure_current(board: dict, args: dict) -> tuple[str, bool]:
+    if not board.get("powered", False):
+        return ("error: board is not powered; call power_on", True)
+
+    ref = args["ref"]
+    parts_dict = board.get("parts") or {}
+    if ref not in parts_dict:
+        return (f"error: no part '{ref}'. Use list_parts to see refs.", True)
+
+    budget = board.get("probe_budget")
+    used = board.get("probes_used", 0)
+    if budget is not None and used >= budget:
+        return (f"error: probe budget used up ({used}/{budget})", True)
+
+    # Call solve() FIRST before mutating probes_used (failure atomicity)
+    from common.circuit.solver import solve
+
+    sol = solve(board)
+
+    board["probes_used"] = used + 1
+    i = sol.get("i", {}).get(ref, 0.0)
+    return (f"I({ref}) = {fmt_current(i)}", False)
+
+
+def _tool_replace_part(board: dict, args: dict) -> tuple[str, bool]:
+    if board.get("powered", False):
+        return ("error: power off the board first", True)
+
+    ref = args["ref"]
+    part_no = args["part_no"]
+
+    parts_dict = board.get("parts") or {}
+    if ref not in parts_dict:
+        return (f"error: no part '{ref}'. Use list_parts to see refs.", True)
+
+    part = parts_dict[ref]
+    part_kind = part.get("kind", "")
+    if part_kind in ("source", "bridge"):
+        return (f"error: {ref} cannot be replaced (sources and bridges have no bin part)", True)
+
+    bin_part = _bin_get(part_no)
+    if bin_part is None:
+        return (f"error: part_no '{part_no}' is not in the parts bin. Use list_bin(kind).", True)
+
+    bin_kind = bin_part.get("kind", "")
+    if bin_kind != part_kind:
+        return (f"error: part_no '{part_no}' is a {bin_kind}, but {ref} is a {part_kind}", True)
+
+    if part_kind == "resistor":
+        old_desc = fmt_ohms(part.get("value", 0.0))
+        new_desc = fmt_ohms(bin_part.get("value", 0.0))
+    elif part_kind == "led":
+        old_desc = f"Vf {part.get('vf', 2.0):.2f} V"
+        new_desc = f"Vf {bin_part.get('vf', 2.0):.2f} V"
+    elif part_kind == "regulator":
+        old_desc = f"{part.get('vout', 0.0):.2f} V out"
+        new_desc = f"{bin_part.get('vout', 0.0):.2f} V out"
+    else:
+        old_desc = str(part.get("value", ""))
+        new_desc = str(bin_part.get("value", ""))
+
+    old_pno = part.get("part_no", "")
+
+    part["part_no"] = part_no
+    part["populated"] = True
+    if "value" in bin_part:
+        part["value"] = bin_part["value"]
+    if "rating_w" in bin_part:
+        part["rating_w"] = bin_part["rating_w"]
+
+    for k in ("vf", "rd", "imax", "vout", "dropout", "ilim"):
+        if k in bin_part:
+            part[k] = bin_part[k]
+        elif k in part and bin_kind not in ("led", "regulator"):
+            del part[k]
+
+    if "damaged" in board and board["damaged"]:
+        board["damaged"] = [d for d in board["damaged"] if d != ref]
+
+    board.setdefault("history", []).append({"tool": "replace_part", "args": dict(args)})
+    return (f"{ref} replaced: {old_desc} ({old_pno}) -> {new_desc} ({part_no})", False)
+
+
+def _tool_remove_bridge(board: dict, args: dict) -> tuple[str, bool]:
+    if board.get("powered", False):
+        return ("error: power off the board first", True)
+
+    ref = args["ref"]
+    parts_dict = board.get("parts") or {}
+    if ref not in parts_dict:
+        return (f"error: no part '{ref}'. Use list_parts to see refs.", True)
+
+    part = parts_dict[ref]
+    if part.get("kind") != "bridge":
+        return (f"error: {ref} is not a bridge", True)
+
+    if not part.get("populated", True):
+        return (f"error: {ref} is already removed", True)
+
+    part["populated"] = False
+    board.setdefault("history", []).append({"tool": "remove_bridge", "args": dict(args)})
+    return (f"{ref} removed", False)
+
+
+def _tool_set_pin_mode(board: dict, args: dict) -> tuple[str, bool]:
+    if board.get("powered", False):
+        return ("error: power off the board first", True)
+
+    pin = args["pin"]
+    mode = args["mode"]
+
+    pins_dict = board.get("pins") or {}
+    if pin not in pins_dict:
+        sorted_pins = sorted(pins_dict.keys(), key=natural_sort_key)
+        return (f"error: no pin '{pin}'. Pins: {', '.join(sorted_pins)}.", True)
+
+    valid_modes = ("output_high", "output_low", "input", "adc")
+    if mode not in valid_modes:
+        return (f"error: invalid mode '{mode}'. Use one of: output_high, output_low, input, adc", True)
+
+    old_mode = pins_dict[pin].get("mode", "")
+    pins_dict[pin]["mode"] = mode
+    board.setdefault("history", []).append({"tool": "set_pin_mode", "args": dict(args)})
+    return (f"{pin} mode: {old_mode} -> {mode}", False)
+
+
+def _tool_list_bin(board: dict, args: dict) -> tuple[str, bool]:
+    kind = args["kind"]
+    if kind not in ("resistor", "led", "regulator"):
+        return (f"error: invalid kind '{kind}'. Use one of: resistor, led, regulator", True)
+
+    items = _bin_all(kind)
+    lines: list[str] = []
+
+    if kind == "resistor":
+        items.sort(key=lambda x: (x.get("value", 0.0), natural_sort_key(str(x.get("part_no", "")))))
+        for it in items:
+            pno = it.get("part_no", "")
+            val_str = fmt_ohms(it.get("value", 0.0))
+            rw = it.get("rating_w")
+            rw_str = f"{_fmt_sig3(rw)} W" if rw is not None else ""
+            lines.append(f"{pno}  {val_str}  {rw_str}".rstrip())
+    elif kind == "led":
+        items.sort(key=lambda x: natural_sort_key(str(x.get("part_no", ""))))
+        for it in items:
+            pno = it.get("part_no", "")
+            vf = it.get("vf", 0.0)
+            imax = it.get("imax", 0.0)
+            lines.append(f"{pno}  Vf {vf:.2f} V  imax {imax * 1000:.2f} mA")
+    elif kind == "regulator":
+        items.sort(key=lambda x: natural_sort_key(str(x.get("part_no", ""))))
+        for it in items:
+            pno = it.get("part_no", "")
+            vout = it.get("vout", 0.0)
+            ilim = it.get("ilim", 0.0)
+            lines.append(f"{pno}  {vout:.2f} V out  ilim {ilim * 1000:.2f} mA")
+
+    lines = lines[:60]
+    return ("\n".join(lines), False)
+
+
 HANDLERS: dict[str, Any] = {
     "read_spec": _tool_read_spec,
     "list_parts": _tool_list_parts,
     "inspect": _tool_inspect,
     "read_schematic": _tool_read_schematic,
+    "list_bin": _tool_list_bin,
+    "power_on": _tool_power_on,
+    "power_off": _tool_power_off,
+    "measure_voltage": _tool_measure_voltage,
+    "measure_current": _tool_measure_current,
+    "replace_part": _tool_replace_part,
+    "remove_bridge": _tool_remove_bridge,
+    "set_pin_mode": _tool_set_pin_mode,
+    "finish": _tool_finish,
 }
 
 IMPLEMENTED_TOOLS: set[str] = set(HANDLERS.keys())
@@ -367,11 +682,14 @@ def apply_tool(board: Any, name: Any, args: Any) -> tuple[dict, str, bool]:
     if name not in HANDLERS:
         return (board_copy, f"error: tool '{name}' is not implemented yet", True)
 
-    # 5. Execute handler with outermost exception guard
+    # 5. Execute handler with outermost exception guard and failure atomicity
     try:
         handler = HANDLERS[name]
         output, is_error = handler(board_copy, args)
     except Exception as exc:
-        return (board_copy, f"error: internal error in {name}: {type(exc).__name__}: {exc}", True)
+        return (copy.deepcopy(board), f"error: internal error in {name}: {type(exc).__name__}: {exc}", True)
 
-    return (board_copy, clip(output), is_error)
+    if is_error:
+        return (copy.deepcopy(board), clip(output), True)
+
+    return (board_copy, clip(output), False)
