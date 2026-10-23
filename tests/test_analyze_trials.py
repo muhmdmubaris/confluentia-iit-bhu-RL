@@ -325,8 +325,9 @@ def test_gate2_lines(tmp_path, k, n, expected):
     assert expected in md
 
 
-def test_stdout_and_md_agree(tmp_path):
+def test_stdout_and_md_agree(tmp_path, monkeypatch):
     """The same numbers (solve rate, means) must appear in both stdout and TRIALS.md."""
+    monkeypatch.setattr(AT, "PRICE_PER_MILLION_TOKENS_USD", None)
     rows = [
         ["led_easy", "0", "success", "1.0", "12", "20000", "60.0", ""],
         ["led_easy", "1", "failure", "0.5",  "8", "15000", "45.0", ""],
