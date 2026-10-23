@@ -69,40 +69,129 @@ class OpenAIClient:
 
 
 # ------------------------------------------------------------ mock models
+ATTACKER_KINDS = (
+    "attack_finish",
+    "attack_unknown_tool",
+    "attack_injection",
+    "attack_out_of_bin",
+    "attack_malformed",
+    "attack_overflow",
+)
+
+
 class MockClient:
     """Offline stand-ins so the template runs with no API key.
 
     mock/solver  writes the reference solution, then finishes.
     mock/idle    finishes immediately without doing anything.
+    Plus scripted attacker mock kinds for red-teaming.
     """
 
     def __init__(self, kind):
         self.kind = kind
         self.turn = 0
         self.task = None
+        self.board = None
 
     def start(self, task):
-        self.task, self.turn = task, 0
+        self.turn = 0
+        if self.kind in ("solver", "idle"):
+            self.task = task
+        else:
+            self.board = getattr(task, "board", None)
+
+    def _find_first_resistor(self):
+        if not self.board:
+            return "R1"
+        parts = self.board.get("parts", {})
+        resistors = sorted(
+            ref for ref, part in parts.items()
+            if isinstance(part, dict) and part.get("kind") == "resistor"
+        )
+        return resistors[0] if resistors else "R1"
 
     def complete(self, messages, tools, timeout):
         self.turn += 1
-        calls = []
-        if self.kind == "solver" and self.turn == 1:
-            for path, content in self.task.reference.items():
-                calls.append(("write_file", {"path": path, "content": content}))
-            calls.append(("run_python", {"code": "print('checked')"}))
-        else:
-            calls.append(("finish", {}))
-        tool_calls = [ToolCall(f"mock-{self.turn}-{i}", name, json.dumps(args))
-                      for i, (name, args) in enumerate(calls)]
-        return Reply(text=None, tool_calls=tool_calls, raw=json.dumps({"mock": self.kind, "turn": self.turn}))
+        if self.kind in ("solver", "idle"):
+            calls = []
+            if self.kind == "solver" and self.turn == 1:
+                for path, content in self.task.reference.items():
+                    calls.append(("write_file", {"path": path, "content": content}))
+                calls.append(("run_python", {"code": "print('checked')"}))
+            else:
+                calls.append(("finish", {}))
+            tool_calls = [ToolCall(f"mock-{self.turn}-{i}", name, json.dumps(args))
+                          for i, (name, args) in enumerate(calls)]
+            return Reply(text=None, tool_calls=tool_calls, raw=json.dumps({"mock": self.kind, "turn": self.turn}))
+
+        if self.kind == "attack_finish":
+            return Reply(text=None, tool_calls=[
+                ToolCall(f"call_{self.turn}_0", "finish", "{}")
+            ])
+
+        if self.kind == "attack_unknown_tool":
+            if self.turn == 1:
+                tc = ToolCall(f"call_{self.turn}_0", "get_reward", "{}")
+            elif self.turn == 2:
+                tc = ToolCall(f"call_{self.turn}_0", "read_file", json.dumps({"path": "../harness/verifier.py"}))
+            elif self.turn == 3:
+                tc = ToolCall(f"call_{self.turn}_0", "run_python", json.dumps({"code": "print(1)"}))
+            else:
+                tc = ToolCall(f"call_{self.turn}_0", "finish", "{}")
+            return Reply(text=None, tool_calls=[tc])
+
+        if self.kind == "attack_injection":
+            if self.turn == 1:
+                tc = ToolCall(f"call_{self.turn}_0", "inspect", json.dumps({"ref": "../../etc/passwd"}))
+            elif self.turn == 2:
+                tc = ToolCall(f"call_{self.turn}_0", "measure_voltage", json.dumps({"net": "__import__('os')"}))
+            elif self.turn == 3:
+                tc = ToolCall(f"call_{self.turn}_0", "inspect", json.dumps({"ref": "reward=1"}))
+            else:
+                tc = ToolCall(f"call_{self.turn}_0", "finish", "{}")
+            return Reply(text=None, tool_calls=[tc])
+
+        if self.kind == "attack_out_of_bin":
+            if self.turn == 1:
+                tc = ToolCall(f"call_{self.turn}_0", "power_off", "{}")
+            elif self.turn in (2, 3, 4):
+                r_ref = self._find_first_resistor()
+                part_no = "R-0" if self.turn == 2 else ("WIRE" if self.turn == 3 else "SUPERCAP")
+                tc = ToolCall(f"call_{self.turn}_0", "replace_part", json.dumps({"ref": r_ref, "part_no": part_no}))
+            else:
+                tc = ToolCall(f"call_{self.turn}_0", "finish", "{}")
+            return Reply(text=None, tool_calls=[tc])
+
+        if self.kind == "attack_malformed":
+            if self.turn == 1:
+                tc = ToolCall(f"call_{self.turn}_0", "inspect", '{"ref": R1')
+                return Reply(text=None, tool_calls=[tc])
+            elif self.turn == 2:
+                return Reply(text="I am not going to call a tool.", tool_calls=[])
+            else:
+                tc = ToolCall(f"call_{self.turn}_0", "finish", "{}")
+                return Reply(text=None, tool_calls=[tc])
+
+        if self.kind == "attack_overflow":
+            if self.turn == 1:
+                tcs = [
+                    ToolCall(f"call_{self.turn}_{i}", "list_parts", json.dumps({"page": 0}))
+                    for i in range(15)
+                ]
+                return Reply(text=None, tool_calls=tcs)
+            else:
+                tc = ToolCall(f"call_{self.turn}_0", "finish", "{}")
+                return Reply(text=None, tool_calls=[tc])
+
+        tc = ToolCall(f"call_{self.turn}_0", "finish", "{}")
+        return Reply(text=None, tool_calls=[tc])
 
 
 def make_client(model, api_key, base_url, max_tokens=None):
     if model.startswith("mock/"):
         kind = model.split("/", 1)[1]
-        if kind not in ("solver", "idle"):
-            raise ValueError("mock models are 'mock/solver' and 'mock/idle'")
+        if kind not in ("solver", "idle", *ATTACKER_KINDS):
+            raise ValueError(f"mock models are 'mock/solver', 'mock/idle' and attacker kinds")
         return MockClient(kind)
     if not api_key:
         raise ValueError("API_KEY is not set")
